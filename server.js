@@ -13,12 +13,10 @@ app.use(
   })
 );
 
-const {
-  MONGO_URL,
-  VERIFY_TOKEN,
-  APP_SECRET,
-  PORT = 3000,
-} = process.env;
+const MONGO_URL = process.env.MONGO_URL;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const APP_SECRET = (process.env.APP_SECRET || "").trim();
+const PORT = process.env.PORT || 3000;
 
 if (!MONGO_URL) {
   throw new Error("MONGO_URL çevre değişkeni eksik.");
