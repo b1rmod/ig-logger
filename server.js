@@ -4,6 +4,10 @@ const mongoose = require("mongoose");
 
 const app = express();
 
+/*
+ * Meta imzasının doğrulanabilmesi için JSON ayrıştırılmadan önce
+ * isteğin ham byte dizisini saklıyoruz.
+ */
 app.use(
   express.json({
     limit: "2mb",
@@ -13,10 +17,14 @@ app.use(
   })
 );
 
-const MONGO_URL = process.env.MONGO_URL;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+/* -------------------------------------------------------------------------- */
+/* Çevre değişkenleri                                                         */
+/* -------------------------------------------------------------------------- */
+
+const MONGO_URL = (process.env.MONGO_URL || "").trim();
+const VERIFY_TOKEN = (process.env.VERIFY_TOKEN || "").trim();
 const APP_SECRET = (process.env.APP_SECRET || "").trim();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 if (!MONGO_URL) {
   throw new Error("MONGO_URL çevre değişkeni eksik.");
@@ -27,8 +35,8 @@ if (!VERIFY_TOKEN) {
 }
 
 if (!APP_SECRET) {
-  console.warn(
-    "UYARI: APP_SECRET tanımlı değil. Webhook imza doğrulaması yapılmayacak."
+  throw new Error(
+    "APP_SECRET çevre değişkeni eksik. Coolify ig-logger ayarlarına eklemelisin."
   );
 }
 
@@ -255,9 +263,20 @@ const messageSchema = new mongoose.Schema(
   }
 );
 
-const WebhookEvent = mongoose.model("WebhookEvent", webhookEventSchema);
-const Comment = mongoose.model("Comment", commentSchema);
-const Message = mongoose.model("Message", messageSchema);
+const WebhookEvent = mongoose.model(
+  "WebhookEvent",
+  webhookEventSchema
+);
+
+const Comment = mongoose.model(
+  "Comment",
+  commentSchema
+);
+
+const Message = mongoose.model(
+  "Message",
+  messageSchema
+);
 
 /* -------------------------------------------------------------------------- */
 /* Yardımcı fonksiyonlar                                                      */
@@ -274,20 +293,49 @@ function toDate(value) {
     return null;
   }
 
-  // Instagram bazı yerlerde saniye, bazı yerlerde milisaniye gönderiyor.
-  return new Date(number < 1_000_000_000_000 ? number * 1000 : number);
+  // Meta bazı alanlarda saniye, bazı alanlarda milisaniye gönderiyor.
+  return new Date(
+    number < 1_000_000_000_000
+      ? number * 1000
+      : number
+  );
 }
 
+/*
+ * Güvenli teşhis döndürür.
+ * App Secret'ın kendisini veya webhook içeriğini loglamaz.
+ */
 function verifyMetaSignature(req) {
-  // APP_SECRET henüz tanımlanmadıysa geçici olarak doğrulamayı atlar.
   if (!APP_SECRET) {
-    return true;
+    return {
+      ok: false,
+      reason: "APP_SECRET_YOK",
+    };
   }
 
-  const receivedSignature = req.get("x-hub-signature-256");
+  const receivedSignature =
+    req.get("x-hub-signature-256");
 
-  if (!receivedSignature || !req.rawBody) {
-    return false;
+  if (!receivedSignature) {
+    return {
+      ok: false,
+      reason: "IMZA_BASLIGI_YOK",
+    };
+  }
+
+  if (!receivedSignature.startsWith("sha256=")) {
+    return {
+      ok: false,
+      reason: "IMZA_FORMATI_HATALI",
+      receivedPrefix: receivedSignature.slice(0, 15),
+    };
+  }
+
+  if (!req.rawBody || req.rawBody.length === 0) {
+    return {
+      ok: false,
+      reason: "HAM_GOVDE_YOK",
+    };
   }
 
   const expectedSignature =
@@ -297,14 +345,42 @@ function verifyMetaSignature(req) {
       .update(req.rawBody)
       .digest("hex");
 
-  const receivedBuffer = Buffer.from(receivedSignature);
-  const expectedBuffer = Buffer.from(expectedSignature);
+  const receivedBuffer = Buffer.from(
+    receivedSignature,
+    "utf8"
+  );
+
+  const expectedBuffer = Buffer.from(
+    expectedSignature,
+    "utf8"
+  );
 
   if (receivedBuffer.length !== expectedBuffer.length) {
-    return false;
+    return {
+      ok: false,
+      reason: "IMZA_UZUNLUGU_FARKLI",
+      receivedPrefix: receivedSignature.slice(0, 15),
+      expectedPrefix: expectedSignature.slice(0, 15),
+    };
   }
 
-  return crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
+  const signaturesMatch = crypto.timingSafeEqual(
+    receivedBuffer,
+    expectedBuffer
+  );
+
+  return {
+    ok: signaturesMatch,
+    reason: signaturesMatch
+      ? "OK"
+      : "IMZA_ESLESMEDI",
+
+    receivedPrefix:
+      receivedSignature.slice(0, 15),
+
+    expectedPrefix:
+      expectedSignature.slice(0, 15),
+  };
 }
 
 function detectEventTypes(body) {
@@ -339,6 +415,10 @@ function detectEventTypes(body) {
   return Array.from(types);
 }
 
+/* -------------------------------------------------------------------------- */
+/* Verileri yorum ve DM koleksiyonlarına ayırma                               */
+/* -------------------------------------------------------------------------- */
+
 async function normalizeWebhook(body, rawEventId) {
   const commentOperations = [];
   const messageOperations = [];
@@ -360,9 +440,12 @@ async function normalizeWebhook(body, rawEventId) {
       }
 
       const commentId = String(value.id);
+
       const parentCommentId = value.parent_id
         ? String(value.parent_id)
         : null;
+
+      const now = new Date();
 
       commentOperations.push({
         updateOne: {
@@ -373,24 +456,34 @@ async function normalizeWebhook(body, rawEventId) {
           update: {
             $set: {
               accountId,
+
               authorId: value.from?.id
                 ? String(value.from.id)
                 : null,
-              username: value.from?.username || null,
+
+              username:
+                value.from?.username || null,
+
               mediaId: value.media?.id
                 ? String(value.media.id)
                 : null,
+
               mediaProductType:
                 value.media?.media_product_type || null,
+
               parentCommentId,
+
               isReply: Boolean(parentCommentId),
+
               text: value.text || "",
+
               eventTime: toDate(entry.time),
-              lastReceivedAt: new Date(),
+
+              lastReceivedAt: now,
             },
 
             $setOnInsert: {
-              firstReceivedAt: new Date(),
+              firstReceivedAt: now,
               rawEventId,
             },
           },
@@ -405,7 +498,10 @@ async function normalizeWebhook(body, rawEventId) {
     for (const messagingEvent of entry.messaging || []) {
       const message = messagingEvent.message;
 
-      // Görüldü gibi mesaj olmayan olayları burada bilerek almıyoruz.
+      /*
+       * Sadece gerçek mesaj olaylarını alıyoruz.
+       * Görüldü gibi mesaj olmayan olaylar kaydedilmiyor.
+       */
       if (!message?.mid) {
         continue;
       }
@@ -419,9 +515,12 @@ async function normalizeWebhook(body, rawEventId) {
         : null;
 
       const direction =
-        message.is_self === true || senderId === accountId
+        message.is_self === true ||
+        senderId === accountId
           ? "outgoing"
           : "incoming";
+
+      const now = new Date();
 
       messageOperations.push({
         updateOne: {
@@ -435,21 +534,38 @@ async function normalizeWebhook(body, rawEventId) {
               senderId,
               recipientId,
               direction,
-              text: message.text ?? null,
-              attachments: message.attachments || [],
-              replyTo: message.reply_to || null,
-              isSelf: message.is_self === true,
-              isEcho: message.is_echo === true,
-              isDeleted: message.is_deleted === true,
-              folder: messagingEvent.folder || null,
+
+              text:
+                message.text ?? null,
+
+              attachments:
+                message.attachments || [],
+
+              replyTo:
+                message.reply_to || null,
+
+              isSelf:
+                message.is_self === true,
+
+              isEcho:
+                message.is_echo === true,
+
+              isDeleted:
+                message.is_deleted === true,
+
+              folder:
+                messagingEvent.folder || null,
+
               eventTime: toDate(
-                messagingEvent.timestamp || entry.time
+                messagingEvent.timestamp ||
+                  entry.time
               ),
-              lastReceivedAt: new Date(),
+
+              lastReceivedAt: now,
             },
 
             $setOnInsert: {
-              firstReceivedAt: new Date(),
+              firstReceivedAt: now,
               rawEventId,
             },
           },
@@ -461,15 +577,21 @@ async function normalizeWebhook(body, rawEventId) {
   }
 
   if (commentOperations.length > 0) {
-    await Comment.bulkWrite(commentOperations, {
-      ordered: false,
-    });
+    await Comment.bulkWrite(
+      commentOperations,
+      {
+        ordered: false,
+      }
+    );
   }
 
   if (messageOperations.length > 0) {
-    await Message.bulkWrite(messageOperations, {
-      ordered: false,
-    });
+    await Message.bulkWrite(
+      messageOperations,
+      {
+        ordered: false,
+      }
+    );
   }
 
   return {
@@ -479,7 +601,7 @@ async function normalizeWebhook(body, rawEventId) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Webhook                                                                    */
+/* Meta webhook doğrulaması                                                   */
 /* -------------------------------------------------------------------------- */
 
 app.get("/webhook", (req, res) => {
@@ -487,84 +609,228 @@ app.get("/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("Webhook Meta tarafından doğrulandı.");
-    return res.status(200).send(challenge);
+  if (
+    mode === "subscribe" &&
+    token === VERIFY_TOKEN
+  ) {
+    console.log(
+      "Webhook Meta tarafından doğrulandı."
+    );
+
+    return res
+      .status(200)
+      .send(challenge);
   }
 
   if (mode || token) {
-    return res.status(403).send("Webhook doğrulaması başarısız.");
+    return res
+      .status(403)
+      .send(
+        "Webhook doğrulaması başarısız."
+      );
   }
 
-  return res.status(200).send("Instagram webhook çalışıyor.");
+  return res
+    .status(200)
+    .send(
+      "Instagram webhook çalışıyor."
+    );
 });
 
+/* -------------------------------------------------------------------------- */
+/* Meta webhook olayları                                                      */
+/* -------------------------------------------------------------------------- */
+
 app.post("/webhook", async (req, res) => {
-  if (!verifyMetaSignature(req)) {
-    console.error("Geçersiz Meta webhook imzası reddedildi.");
-    return res.status(401).send("INVALID_SIGNATURE");
+  const signatureResult =
+    verifyMetaSignature(req);
+
+  if (!signatureResult.ok) {
+    console.error(
+      "Webhook imzası reddedildi:",
+      {
+        reason:
+          signatureResult.reason,
+
+        appSecretDefined:
+          Boolean(APP_SECRET),
+
+        appSecretLength:
+          APP_SECRET.length,
+
+        rawBodySize:
+          req.rawBody?.length || 0,
+
+        contentType:
+          req.get("content-type") || null,
+
+        userAgent:
+          req.get("user-agent") || null,
+
+        receivedSignaturePrefix:
+          signatureResult.receivedPrefix || null,
+
+        expectedSignaturePrefix:
+          signatureResult.expectedPrefix || null,
+      }
+    );
+
+    return res
+      .status(401)
+      .send("INVALID_SIGNATURE");
   }
 
   try {
     const body = req.body;
-    const eventTypes = detectEventTypes(body);
+
+    if (
+      !body ||
+      body.object !== "instagram" ||
+      !Array.isArray(body.entry)
+    ) {
+      console.warn(
+        "Instagram dışı veya geçersiz webhook gövdesi reddedildi."
+      );
+
+      return res
+        .status(400)
+        .send("INVALID_PAYLOAD");
+    }
+
+    const eventTypes =
+      detectEventTypes(body);
 
     const eventHash = crypto
       .createHash("sha256")
-      .update(req.rawBody || JSON.stringify(body))
+      .update(req.rawBody)
       .digest("hex");
 
-    const accountIds = (body.entry || [])
-      .map((entry) => String(entry.id || ""))
+    const accountIds = body.entry
+      .map((entry) =>
+        String(entry.id || "")
+      )
       .filter(Boolean);
 
-    const rawEvent = await WebhookEvent.findOneAndUpdate(
-      {
-        eventHash,
-      },
-      {
-        $setOnInsert: {
-          eventHash,
-          object: body.object || null,
-          accountIds,
-          eventTypes,
-          payload: body,
-          receivedAt: new Date(),
-        },
-      },
-      {
-        upsert: true,
-        new: true,
-        setDefaultsOnInsert: true,
-      }
-    );
+    let rawEvent;
 
-    const result = await normalizeWebhook(body, rawEvent._id);
+    try {
+      rawEvent =
+        await WebhookEvent.findOneAndUpdate(
+          {
+            eventHash,
+          },
+
+          {
+            $setOnInsert: {
+              eventHash,
+
+              object:
+                body.object || null,
+
+              accountIds,
+
+              eventTypes,
+
+              payload: body,
+
+              receivedAt:
+                new Date(),
+            },
+          },
+
+          {
+            upsert: true,
+            new: true,
+            setDefaultsOnInsert: true,
+          }
+        );
+    } catch (error) {
+      /*
+       * Aynı webhook aynı anda iki kez gelirse unique index
+       * çakışabilir. Böyle bir durumda mevcut kaydı buluyoruz.
+       */
+      if (error?.code === 11000) {
+        rawEvent =
+          await WebhookEvent.findOne({
+            eventHash,
+          });
+      } else {
+        throw error;
+      }
+    }
+
+    if (!rawEvent) {
+      throw new Error(
+        "Ham webhook kaydı oluşturulamadı."
+      );
+    }
+
+    const result =
+      await normalizeWebhook(
+        body,
+        rawEvent._id
+      );
 
     console.log(
       [
         "Webhook kaydedildi",
-        `tür=${eventTypes.join(",") || "bilinmiyor"}`,
+        `tür=${
+          eventTypes.join(",") ||
+          "bilinmiyor"
+        }`,
         `yorum=${result.comments}`,
         `dm=${result.messages}`,
       ].join(" | ")
     );
 
-    return res.status(200).send("EVENT_RECEIVED");
+    return res
+      .status(200)
+      .send("EVENT_RECEIVED");
   } catch (error) {
-    console.error("Webhook işleme hatası:", error);
-    return res.status(500).send("WEBHOOK_ERROR");
+    console.error(
+      "Webhook işleme hatası:",
+      {
+        name:
+          error?.name || "Error",
+
+        message:
+          error?.message ||
+          "Bilinmeyen hata",
+
+        code:
+          error?.code || null,
+      }
+    );
+
+    /*
+     * 500 dönüyoruz ki Meta daha sonra yeniden deneyebilsin.
+     */
+    return res
+      .status(500)
+      .send("WEBHOOK_ERROR");
   }
 });
+
+/* -------------------------------------------------------------------------- */
+/* Sağlık kontrolü                                                            */
+/* -------------------------------------------------------------------------- */
 
 app.get("/health", (req, res) => {
   return res.status(200).json({
     status: "ok",
+
     mongodb:
       mongoose.connection.readyState === 1
         ? "connected"
         : "disconnected",
-    time: new Date().toISOString(),
+
+    signatureVerification:
+      APP_SECRET
+        ? "enabled"
+        : "disabled",
+
+    time:
+      new Date().toISOString(),
   });
 });
 
@@ -575,13 +841,25 @@ app.get("/health", (req, res) => {
 mongoose
   .connect(MONGO_URL)
   .then(() => {
-    console.log("MongoDB bağlantısı başarılı.");
+    console.log(
+      "MongoDB bağlantısı başarılı."
+    );
+
+    console.log(
+      `Webhook imza doğrulaması aktif. APP_SECRET uzunluğu: ${APP_SECRET.length}`
+    );
 
     app.listen(PORT, () => {
-      console.log(`Sunucu ${PORT} portunda çalışıyor.`);
+      console.log(
+        `Sunucu ${PORT} portunda çalışıyor.`
+      );
     });
   })
   .catch((error) => {
-    console.error("MongoDB bağlantı hatası:", error);
+    console.error(
+      "MongoDB bağlantı hatası:",
+      error
+    );
+
     process.exit(1);
   });
