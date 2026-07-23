@@ -26,6 +26,9 @@ const APP_SECRET = (process.env.APP_SECRET || "").trim();
 const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || "").trim();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 const PORT = Number(process.env.PORT || 3000);
+const RAW_EVENT_RETENTION_DAYS = 7;
+const RAW_EVENT_TTL_MS = RAW_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const PANEL_CSRF_TOKEN = crypto.randomBytes(32).toString("hex");
 
 for (const [name, value] of Object.entries({
   MONGO_URL,
@@ -51,6 +54,8 @@ const webhookEventSchema = new mongoose.Schema(
     eventTypes: { type: [String], default: [] },
     payload: { type: mongoose.Schema.Types.Mixed, required: true },
     receivedAt: { type: Date, default: Date.now, index: true },
+    processedAt: { type: Date, default: null, index: true },
+    expiresAt: { type: Date, required: true },
   },
   { versionKey: false, collection: "webhook_events" }
 );
@@ -70,6 +75,13 @@ const commentSchema = new mongoose.Schema(
     firstReceivedAt: { type: Date, default: Date.now },
     lastReceivedAt: { type: Date, default: Date.now },
     rawEventId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    status: {
+      type: String,
+      enum: ["unread", "reviewed", "archived"],
+      default: "unread",
+      index: true,
+    },
+    statusUpdatedAt: { type: Date, default: Date.now },
   },
   { versionKey: false, collection: "comments" }
 );
@@ -162,6 +174,70 @@ function encodeQuery(params) {
   }
   const text = query.toString();
   return text ? `?${text}` : "";
+}
+
+function safeReturnTo(value, fallback = "/panel/comments") {
+  const candidate = String(value || "");
+  if (!candidate.startsWith("/panel/comments")) return fallback;
+  if (candidate.startsWith("//") || candidate.includes("\\")) return fallback;
+  return candidate.slice(0, 1000);
+}
+
+function verifyPanelCsrf(req) {
+  return safeEqual(req.body?.csrf || "", PANEL_CSRF_TOKEN);
+}
+
+function statusLabel(status) {
+  if (status === "reviewed") return "İncelendi";
+  if (status === "archived") return "Arşiv";
+  return "Okunmamış";
+}
+
+function statusClass(status) {
+  if (status === "reviewed") return "reviewed";
+  if (status === "archived") return "archived";
+  return "unread";
+}
+
+async function removeCommentFromRawEvent(rawEventId, commentId) {
+  if (!rawEventId) return;
+
+  const rawEvent = await WebhookEvent.findById(rawEventId);
+  if (!rawEvent) return;
+
+  const payload = rawEvent.payload || {};
+  let removed = false;
+
+  for (const entry of payload.entry || []) {
+    if (!Array.isArray(entry.changes)) continue;
+    const before = entry.changes.length;
+    entry.changes = entry.changes.filter((change) => {
+      const isTarget =
+        change?.field === "comments" &&
+        String(change?.value?.id || "") === String(commentId);
+      if (isTarget) removed = true;
+      return !isTarget;
+    });
+    if (before !== entry.changes.length) removed = true;
+  }
+
+  if (!removed) return;
+
+  payload.entry = (payload.entry || []).filter((entry) => {
+    const hasChanges = Array.isArray(entry.changes) && entry.changes.length > 0;
+    const hasMessaging = Array.isArray(entry.messaging) && entry.messaging.length > 0;
+    return hasChanges || hasMessaging;
+  });
+
+  if (payload.entry.length === 0) {
+    await WebhookEvent.deleteOne({ _id: rawEvent._id });
+    return;
+  }
+
+  rawEvent.payload = payload;
+  rawEvent.eventTypes = detectEventTypes(payload);
+  rawEvent.markModified("payload");
+  await rawEvent.save();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -298,7 +374,12 @@ async function normalizeWebhook(body, rawEventId) {
               eventTime: toDate(entry.time),
               lastReceivedAt: now,
             },
-            $setOnInsert: { firstReceivedAt: now, rawEventId },
+            $setOnInsert: {
+              firstReceivedAt: now,
+              rawEventId,
+              status: "unread",
+              statusUpdatedAt: now,
+            },
           },
           upsert: true,
         },
@@ -377,7 +458,7 @@ function layout({ title, active, stats, content }) {
   <meta name="robots" content="noindex,nofollow,noarchive">
   <title>${escapeHtml(title)} · b1rmod Panel</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b0d12; --panel:#121620; --panel2:#171c28; --line:#293142; --text:#f4f6fb; --muted:#9da8ba; --accent:#8da2ff; --good:#52d89f; --warn:#ffc76b; }
+    :root { color-scheme: dark; --bg:#0b0d12; --panel:#121620; --panel2:#171c28; --line:#293142; --text:#f4f6fb; --muted:#9da8ba; --accent:#8da2ff; --good:#52d89f; --warn:#ffc76b; --danger:#ff7b86; --archive:#b59cff; }
     * { box-sizing:border-box; }
     body { margin:0; background:var(--bg); color:var(--text); font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
     a { color:inherit; text-decoration:none; }
@@ -389,7 +470,7 @@ function layout({ title, active, stats, content }) {
     nav a { padding:9px 12px; border-radius:10px; color:var(--muted); }
     nav a.active, nav a:hover { color:var(--text); background:var(--panel2); }
     main { padding:28px 0 48px; }
-    .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:18px; }
+    .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:18px; }
     .stat { padding:17px; background:var(--panel); border:1px solid var(--line); border-radius:16px; }
     .stat strong { display:block; font-size:27px; letter-spacing:-.04em; }
     .stat span { color:var(--muted); font-size:13px; }
@@ -398,8 +479,18 @@ function layout({ title, active, stats, content }) {
     input, select { min-height:42px; border:1px solid var(--line); border-radius:10px; background:#0e121a; color:var(--text); padding:0 12px; }
     input[type=search] { flex:1 1 280px; }
     button, .button { min-height:42px; display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:10px; padding:0 15px; background:var(--accent); color:#080b12; font-weight:800; cursor:pointer; }
+    .button-secondary { background:var(--panel2); color:var(--text); border:1px solid var(--line); }
+    .button-archive { background:#332b4f; color:#e4ddff; border:1px solid #544776; }
+    .button-danger { background:#3b2026; color:#ffd8dc; border:1px solid #6b3039; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+    .actions form { margin:0; }
+    .actions button { min-height:36px; padding:0 12px; font-size:13px; }
     .list { display:grid; gap:10px; }
-    .card { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:17px; overflow-wrap:anywhere; }
+    .card { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:17px; overflow-wrap:anywhere; transition:.16s ease; }
+    .card.unread { border-color:#5266b4; box-shadow:inset 4px 0 0 var(--accent); }
+    .card.reviewed { opacity:.82; }
+    .card.archived { border-color:#4b426e; background:#11131c; opacity:.76; }
+    .card:hover { transform:translateY(-1px); }
     .card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:14px; margin-bottom:10px; }
     .identity { font-weight:800; }
     .time { color:var(--muted); font-size:13px; text-align:right; white-space:nowrap; }
@@ -408,6 +499,12 @@ function layout({ title, active, stats, content }) {
     .pill { padding:5px 8px; border-radius:999px; background:var(--panel2); color:var(--muted); font-size:12px; border:1px solid var(--line); }
     .pill.good { color:var(--good); }
     .pill.warn { color:var(--warn); }
+    .pill.unread { color:var(--accent); }
+    .pill.reviewed { color:var(--good); }
+    .pill.archived { color:var(--archive); }
+    .parent-preview { margin-top:13px; padding:12px; border-radius:12px; background:#0e121a; border:1px solid var(--line); color:var(--muted); }
+    .parent-preview strong { color:var(--text); display:block; margin-bottom:5px; }
+    .notice { margin-bottom:14px; padding:12px 14px; border:1px solid #425487; border-radius:12px; background:#121a31; color:#dce4ff; }
     details { margin-top:12px; color:var(--muted); font-size:12px; }
     summary { cursor:pointer; }
     .empty { text-align:center; padding:48px 20px; color:var(--muted); background:var(--panel); border:1px solid var(--line); border-radius:16px; }
@@ -417,11 +514,14 @@ function layout({ title, active, stats, content }) {
     .page-info { color:var(--muted); font-size:13px; }
     .status-grid { display:grid; gap:12px; grid-template-columns:repeat(2,1fr); }
     .code { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; background:#0d1119; border:1px solid var(--line); border-radius:10px; padding:12px; overflow:auto; }
+    @media (max-width:900px) { .stats { grid-template-columns:repeat(2,1fr); } }
     @media (max-width:720px) {
       .top { align-items:flex-start; flex-direction:column; padding:14px 0; }
       .stats, .status-grid { grid-template-columns:1fr; }
       .card-head { flex-direction:column; }
       .time { text-align:left; white-space:normal; }
+      .actions { display:grid; grid-template-columns:1fr 1fr; }
+      .actions button { width:100%; }
     }
   </style>
 </head>
@@ -439,8 +539,9 @@ function layout({ title, active, stats, content }) {
 <main class="shell">
   <section class="stats">
     <div class="stat"><strong>${stats.comments}</strong><span>Toplam yorum</span></div>
+    <div class="stat"><strong>${stats.unreadComments}</strong><span>Okunmamış yorum</span></div>
+    <div class="stat"><strong>${stats.archivedComments}</strong><span>Arşivlenmiş yorum</span></div>
     <div class="stat"><strong>${stats.messages}</strong><span>Toplam DM</span></div>
-    <div class="stat"><strong>${stats.rawEvents}</strong><span>Ham webhook</span></div>
   </section>
   ${content}
 </main>
@@ -449,12 +550,16 @@ function layout({ title, active, stats, content }) {
 }
 
 async function getStats() {
-  const [comments, messages, rawEvents] = await Promise.all([
-    Comment.countDocuments({}),
-    Message.countDocuments({}),
-    WebhookEvent.countDocuments({}),
-  ]);
-  return { comments, messages, rawEvents };
+  const [comments, unreadComments, archivedComments, messages, rawEvents] =
+    await Promise.all([
+      Comment.countDocuments({}),
+      Comment.countDocuments({ status: "unread" }),
+      Comment.countDocuments({ status: "archived" }),
+      Message.countDocuments({}),
+      WebhookEvent.countDocuments({}),
+    ]);
+
+  return { comments, unreadComments, archivedComments, messages, rawEvents };
 }
 
 function paginationHtml({ page, pages, basePath, params }) {
@@ -500,10 +605,16 @@ app.get("/panel/comments", async (req, res, next) => {
     const type = ["all", "main", "reply"].includes(req.query.type)
       ? req.query.type
       : "all";
+    const status = ["all", "unread", "reviewed", "archived"].includes(
+      req.query.status
+    )
+      ? req.query.status
+      : "all";
 
     const filter = {};
     if (type === "main") filter.isReply = false;
     if (type === "reply") filter.isReply = true;
+    if (status !== "all") filter.status = status;
 
     if (q) {
       const regex = new RegExp(escapeRegex(q), "i");
@@ -520,45 +631,163 @@ app.get("/panel/comments", async (req, res, next) => {
       getStats(),
     ]);
 
+    const parentIds = items
+      .map((item) => item.parentCommentId)
+      .filter(Boolean);
+
+    const parentItems = parentIds.length
+      ? await Comment.find({ commentId: { $in: parentIds } })
+          .select({ commentId: 1, username: 1, text: 1 })
+          .lean()
+      : [];
+
+    const parentMap = new Map(parentItems.map((item) => [item.commentId, item]));
     const pages = Math.max(1, Math.ceil(total / limit));
     const safePage = Math.min(page, pages);
+    const returnTo = `/panel/comments${encodeQuery({ q, type, status, limit, page: safePage })}`;
 
     const cards = items.length
       ? items
-          .map(
-            (item) => `<article class="card">
+          .map((item) => {
+            const currentStatus = item.status || "unread";
+            const parent = item.parentCommentId
+              ? parentMap.get(item.parentCommentId)
+              : null;
+
+            const parentPreview = item.isReply
+              ? `<div class="parent-preview">
+                  <strong>Şu yoruma yanıt:</strong>
+                  ${
+                    parent
+                      ? `<div>@${escapeHtml(parent.username || "kullanıcı-adı-yok")}: ${escapeHtml(
+                          parent.text || "(Boş yorum)"
+                        )}</div>`
+                      : `<div>Ana yorum henüz veritabanında bulunmuyor.</div>`
+                  }
+                </div>`
+              : "";
+
+            let primaryAction = "";
+            if (currentStatus === "unread") {
+              primaryAction = `<form method="post" action="/panel/comments/${encodeURIComponent(
+                item.commentId
+              )}/status">
+                <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+                <input type="hidden" name="status" value="reviewed">
+                <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+                <button type="submit">✓ İncelendi</button>
+              </form>`;
+            } else if (currentStatus === "reviewed") {
+              primaryAction = `<form method="post" action="/panel/comments/${encodeURIComponent(
+                item.commentId
+              )}/status">
+                <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+                <input type="hidden" name="status" value="unread">
+                <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+                <button class="button-secondary" type="submit">● Okunmamış yap</button>
+              </form>`;
+            } else {
+              primaryAction = `<form method="post" action="/panel/comments/${encodeURIComponent(
+                item.commentId
+              )}/status">
+                <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+                <input type="hidden" name="status" value="reviewed">
+                <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+                <button class="button-secondary" type="submit">↩ Arşivden çıkar</button>
+              </form>`;
+            }
+
+            const archiveAction = currentStatus === "archived"
+              ? ""
+              : `<form method="post" action="/panel/comments/${encodeURIComponent(
+                  item.commentId
+                )}/status">
+                  <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+                  <input type="hidden" name="status" value="archived">
+                  <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+                  <button class="button-archive" type="submit">Arşivle</button>
+                </form>`;
+
+            return `<article class="card ${statusClass(currentStatus)}">
               <div class="card-head">
-                <div class="identity">@${escapeHtml(item.username || "kullanıcı-adı-yok")}</div>
-                <div class="time">${escapeHtml(formatDate(item.eventTime || item.firstReceivedAt))}</div>
+                <div class="identity">@${escapeHtml(
+                  item.username || "kullanıcı-adı-yok"
+                )}</div>
+                <div class="time">${escapeHtml(
+                  formatDate(item.eventTime || item.firstReceivedAt)
+                )}</div>
               </div>
               <div class="text">${escapeHtml(item.text || "(Boş yorum)")}</div>
+              ${parentPreview}
               <div class="meta">
-                <span class="pill ${item.isReply ? "warn" : "good"}">${item.isReply ? "Yanıt" : "Ana yorum"}</span>
-                <span class="pill">${escapeHtml(item.mediaProductType || "Medya türü yok")}</span>
+                <span class="pill ${statusClass(currentStatus)}">${statusLabel(
+                  currentStatus
+                )}</span>
+                <span class="pill ${item.isReply ? "warn" : "good"}">${
+                  item.isReply ? "Yanıt" : "Ana yorum"
+                }</span>
+                <span class="pill">${escapeHtml(
+                  item.mediaProductType || "Medya türü yok"
+                )}</span>
                 <span class="pill">Medya: ${escapeHtml(item.mediaId || "—")}</span>
+              </div>
+              <div class="actions">
+                ${primaryAction}
+                ${archiveAction}
+                <form method="post" action="/panel/comments/${encodeURIComponent(
+                  item.commentId
+                )}/delete" onsubmit="return confirm('Bu yorum veritabanından kalıcı olarak silinecek. Geri alınamaz. Emin misin?');">
+                  <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+                  <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+                  <button class="button-danger" type="submit">Kalıcı sil</button>
+                </form>
               </div>
               <details>
                 <summary>Teknik bilgiler</summary>
                 <div>Yorum ID: ${escapeHtml(item.commentId)}</div>
                 <div>Yazar ID: ${escapeHtml(item.authorId || "—")}</div>
                 <div>Ana yorum ID: ${escapeHtml(item.parentCommentId || "—")}</div>
+                <div>Durum: ${escapeHtml(currentStatus)}</div>
               </details>
-            </article>`
-          )
+            </article>`;
+          })
           .join("")
       : '<div class="empty">Bu filtreyle eşleşen yorum bulunamadı.</div>';
 
+    const notice = String(req.query.notice || "");
+    const noticeHtml = notice
+      ? `<div class="notice">${escapeHtml(
+          notice === "deleted"
+            ? "Yorum ve bağlı ham webhook verisi kalıcı olarak silindi."
+            : "Yorum durumu güncellendi."
+        )}</div>`
+      : "";
+
     const content = `
+      ${noticeHtml}
       <form class="toolbar" method="get" action="/panel/comments">
-        <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Yorum, kullanıcı adı veya ID ara">
+        <input type="search" name="q" value="${escapeHtml(
+          q
+        )}" placeholder="Yorum, kullanıcı adı veya ID ara">
+        <select name="status">
+          <option value="all" ${status === "all" ? "selected" : ""}>Tüm durumlar</option>
+          <option value="unread" ${status === "unread" ? "selected" : ""}>Okunmamış</option>
+          <option value="reviewed" ${status === "reviewed" ? "selected" : ""}>İncelendi</option>
+          <option value="archived" ${status === "archived" ? "selected" : ""}>Arşiv</option>
+        </select>
         <select name="type">
-          <option value="all" ${type === "all" ? "selected" : ""}>Tümü</option>
+          <option value="all" ${type === "all" ? "selected" : ""}>Tüm yorum türleri</option>
           <option value="main" ${type === "main" ? "selected" : ""}>Ana yorumlar</option>
           <option value="reply" ${type === "reply" ? "selected" : ""}>Yanıtlar</option>
         </select>
         <select name="limit">
           ${[25, 50, 100]
-            .map((value) => `<option value="${value}" ${limit === value ? "selected" : ""}>${value} / sayfa</option>`)
+            .map(
+              (value) =>
+                `<option value="${value}" ${
+                  limit === value ? "selected" : ""
+                }>${value} / sayfa</option>`
+            )
             .join("")}
         </select>
         <button type="submit">Filtrele</button>
@@ -568,12 +797,58 @@ app.get("/panel/comments", async (req, res, next) => {
         page: safePage,
         pages,
         basePath: "/panel/comments",
-        params: { q, type, limit },
+        params: { q, type, status, limit },
       })}`;
 
     return res.status(200).send(
       layout({ title: "Yorumlar", active: "comments", stats, content })
     );
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/panel/comments/:commentId/status", async (req, res, next) => {
+  try {
+    if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
+
+    const commentId = String(req.params.commentId || "");
+    const status = ["unread", "reviewed", "archived"].includes(req.body.status)
+      ? req.body.status
+      : null;
+
+    if (!/^\d+$/.test(commentId) || !status) {
+      return res.status(400).send("Geçersiz yorum işlemi.");
+    }
+
+    await Comment.updateOne(
+      { commentId },
+      { $set: { status, statusUpdatedAt: new Date() } }
+    );
+
+    const returnTo = safeReturnTo(req.body.returnTo);
+    const separator = returnTo.includes("?") ? "&" : "?";
+    return res.redirect(303, `${returnTo}${separator}notice=updated`);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/panel/comments/:commentId/delete", async (req, res, next) => {
+  try {
+    if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
+
+    const commentId = String(req.params.commentId || "");
+    if (!/^\d+$/.test(commentId)) {
+      return res.status(400).send("Geçersiz yorum kimliği.");
+    }
+
+    const item = await Comment.findOneAndDelete({ commentId });
+    if (item) await removeCommentFromRawEvent(item.rawEventId, commentId);
+
+    const returnTo = safeReturnTo(req.body.returnTo);
+    const separator = returnTo.includes("?") ? "&" : "?";
+    return res.redirect(303, `${returnTo}${separator}notice=deleted`);
   } catch (error) {
     return next(error);
   }
@@ -693,6 +968,7 @@ app.get("/panel/status", async (req, res, next) => {
           <span class="pill good">Node.js çalışıyor</span>
           <span class="pill ${mongoose.connection.readyState === 1 ? "good" : "warn"}">MongoDB ${mongoose.connection.readyState === 1 ? "bağlı" : "bağlı değil"}</span>
           <span class="pill good">İmza doğrulaması aktif</span>
+          <span class="pill good">Ham kayıtlar ${RAW_EVENT_RETENTION_DAYS} gün saklanır</span>
         </div>
       </section>
       <section class="card">
@@ -749,34 +1025,42 @@ app.post("/webhook", async (req, res) => {
       .map((entry) => String(entry.id || ""))
       .filter(Boolean);
 
-    let rawEvent;
+    let rawEvent = await WebhookEvent.findOne({ eventHash });
 
-    try {
-      rawEvent = await WebhookEvent.findOneAndUpdate(
-        { eventHash },
-        {
-          $setOnInsert: {
-            eventHash,
-            object: body.object || null,
-            accountIds,
-            eventTypes,
-            payload: body,
-            receivedAt: new Date(),
-          },
-        },
-        { upsert: true, new: true, setDefaultsOnInsert: true }
-      );
-    } catch (error) {
-      if (error?.code === 11000) {
-        rawEvent = await WebhookEvent.findOne({ eventHash });
-      } else {
-        throw error;
+    if (rawEvent?.processedAt) {
+      console.log(`Tekrarlanan webhook yok sayıldı | tür=${eventTypes.join(",") || "bilinmiyor"}`);
+      return res.status(200).send("EVENT_RECEIVED");
+    }
+
+    if (!rawEvent) {
+      try {
+        rawEvent = await WebhookEvent.create({
+          eventHash,
+          object: body.object || null,
+          accountIds,
+          eventTypes,
+          payload: body,
+          receivedAt: new Date(),
+          processedAt: null,
+          expiresAt: new Date(Date.now() + RAW_EVENT_TTL_MS),
+        });
+      } catch (error) {
+        if (error?.code === 11000) {
+          rawEvent = await WebhookEvent.findOne({ eventHash });
+          if (rawEvent?.processedAt) {
+            return res.status(200).send("EVENT_RECEIVED");
+          }
+        } else {
+          throw error;
+        }
       }
     }
 
     if (!rawEvent) throw new Error("Ham webhook kaydı oluşturulamadı.");
 
     const result = await normalizeWebhook(body, rawEvent._id);
+    rawEvent.processedAt = new Date();
+    await rawEvent.save();
 
     console.log(
       [
@@ -828,15 +1112,39 @@ app.use((error, req, res, next) => {
 /* Başlatma                                                                   */
 /* -------------------------------------------------------------------------- */
 
+async function runMigrations() {
+  await Comment.updateMany(
+    { status: { $exists: false } },
+    { $set: { status: "unread", statusUpdatedAt: new Date() } }
+  );
+
+  await WebhookEvent.updateMany(
+    { processedAt: { $exists: false } },
+    { $set: { processedAt: new Date() } }
+  );
+
+  await WebhookEvent.updateMany(
+    { expiresAt: { $exists: false } },
+    { $set: { expiresAt: new Date(Date.now() + RAW_EVENT_TTL_MS) } }
+  );
+
+  await WebhookEvent.collection.createIndex(
+    { expiresAt: 1 },
+    { expireAfterSeconds: 0, name: "expiresAt_ttl" }
+  );
+}
+
 mongoose
   .connect(MONGO_URL)
-  .then(() => {
+  .then(async () => {
     console.log("MongoDB bağlantısı başarılı.");
+    await runMigrations();
+    console.log(`Panel v1.1 hazır. Ham webhook saklama süresi: ${RAW_EVENT_RETENTION_DAYS} gün.`);
     app.listen(PORT, () => {
       console.log(`Sunucu ${PORT} portunda çalışıyor.`);
     });
   })
   .catch((error) => {
-    console.error("MongoDB bağlantı hatası:", error);
+    console.error("MongoDB bağlantı/başlatma hatası:", error);
     process.exit(1);
   });
