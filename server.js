@@ -77,8 +77,8 @@ const commentSchema = new mongoose.Schema(
     rawEventId: { type: mongoose.Schema.Types.ObjectId, default: null },
     status: {
       type: String,
-      enum: ["unread", "reviewed", "archived"],
-      default: "unread",
+      enum: ["inbox", "archived"],
+      default: "inbox",
       index: true,
     },
     statusUpdatedAt: { type: Date, default: Date.now },
@@ -109,6 +109,13 @@ const messageSchema = new mongoose.Schema(
     firstReceivedAt: { type: Date, default: Date.now },
     lastReceivedAt: { type: Date, default: Date.now },
     rawEventId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    status: {
+      type: String,
+      enum: ["inbox", "archived"],
+      default: "inbox",
+      index: true,
+    },
+    statusUpdatedAt: { type: Date, default: Date.now },
   },
   { versionKey: false, collection: "messages" }
 );
@@ -178,8 +185,22 @@ function encodeQuery(params) {
 
 function safeReturnTo(value, fallback = "/panel/comments") {
   const candidate = String(value || "");
-  if (!candidate.startsWith("/panel/comments")) return fallback;
-  if (candidate.startsWith("//") || candidate.includes("\\")) return fallback;
+  const allowed = [
+    "/panel/comments",
+    "/panel/comments/archive",
+    "/panel/messages",
+    "/panel/messages/archive",
+    "/panel/status",
+  ];
+
+  const isAllowed = allowed.some(
+    (route) => candidate === route || candidate.startsWith(`${route}?`)
+  );
+
+  if (!isAllowed || candidate.startsWith("//") || candidate.includes("\\")) {
+    return fallback;
+  }
+
   return candidate.slice(0, 1000);
 }
 
@@ -187,42 +208,21 @@ function verifyPanelCsrf(req) {
   return safeEqual(req.body?.csrf || "", PANEL_CSRF_TOKEN);
 }
 
-function statusLabel(status) {
-  if (status === "reviewed") return "İncelendi";
-  if (status === "archived") return "Arşiv";
-  return "Okunmamış";
+function selectedValues(value, max = 100) {
+  const values = Array.isArray(value) ? value : value ? [value] : [];
+  return Array.from(new Set(values.map((item) => String(item).trim()).filter(Boolean))).slice(
+    0,
+    max
+  );
 }
 
-function statusClass(status) {
-  if (status === "reviewed") return "reviewed";
-  if (status === "archived") return "archived";
-  return "unread";
+function redirectWithNotice(res, returnTo, notice) {
+  const target = safeReturnTo(returnTo);
+  const separator = target.includes("?") ? "&" : "?";
+  return res.redirect(303, `${target}${separator}notice=${encodeURIComponent(notice)}`);
 }
 
-async function removeCommentFromRawEvent(rawEventId, commentId) {
-  if (!rawEventId) return;
-
-  const rawEvent = await WebhookEvent.findById(rawEventId);
-  if (!rawEvent) return;
-
-  const payload = rawEvent.payload || {};
-  let removed = false;
-
-  for (const entry of payload.entry || []) {
-    if (!Array.isArray(entry.changes)) continue;
-    const before = entry.changes.length;
-    entry.changes = entry.changes.filter((change) => {
-      const isTarget =
-        change?.field === "comments" &&
-        String(change?.value?.id || "") === String(commentId);
-      if (isTarget) removed = true;
-      return !isTarget;
-    });
-    if (before !== entry.changes.length) removed = true;
-  }
-
-  if (!removed) return;
-
+async function updateRawEventAfterRemoval(rawEvent, payload) {
   payload.entry = (payload.entry || []).filter((entry) => {
     const hasChanges = Array.isArray(entry.changes) && entry.changes.length > 0;
     const hasMessaging = Array.isArray(entry.messaging) && entry.messaging.length > 0;
@@ -238,6 +238,53 @@ async function removeCommentFromRawEvent(rawEventId, commentId) {
   rawEvent.eventTypes = detectEventTypes(payload);
   rawEvent.markModified("payload");
   await rawEvent.save();
+}
+
+async function removeCommentFromRawEvent(rawEventId, commentId) {
+  if (!rawEventId) return;
+
+  const rawEvent = await WebhookEvent.findById(rawEventId);
+  if (!rawEvent) return;
+
+  const payload = rawEvent.payload || {};
+  let removed = false;
+
+  for (const entry of payload.entry || []) {
+    if (!Array.isArray(entry.changes)) continue;
+
+    entry.changes = entry.changes.filter((change) => {
+      const isTarget =
+        change?.field === "comments" &&
+        String(change?.value?.id || "") === String(commentId);
+
+      if (isTarget) removed = true;
+      return !isTarget;
+    });
+  }
+
+  if (removed) await updateRawEventAfterRemoval(rawEvent, payload);
+}
+
+async function removeMessageFromRawEvent(rawEventId, mid) {
+  if (!rawEventId) return;
+
+  const rawEvent = await WebhookEvent.findById(rawEventId);
+  if (!rawEvent) return;
+
+  const payload = rawEvent.payload || {};
+  let removed = false;
+
+  for (const entry of payload.entry || []) {
+    if (!Array.isArray(entry.messaging)) continue;
+
+    entry.messaging = entry.messaging.filter((event) => {
+      const isTarget = String(event?.message?.mid || "") === String(mid);
+      if (isTarget) removed = true;
+      return !isTarget;
+    });
+  }
+
+  if (removed) await updateRawEventAfterRemoval(rawEvent, payload);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -377,7 +424,7 @@ async function normalizeWebhook(body, rawEventId) {
             $setOnInsert: {
               firstReceivedAt: now,
               rawEventId,
-              status: "unread",
+              status: "inbox",
               statusUpdatedAt: now,
             },
           },
@@ -419,7 +466,12 @@ async function normalizeWebhook(body, rawEventId) {
               eventTime: toDate(messagingEvent.timestamp || entry.time),
               lastReceivedAt: now,
             },
-            $setOnInsert: { firstReceivedAt: now, rawEventId },
+            $setOnInsert: {
+              firstReceivedAt: now,
+              rawEventId,
+              status: "inbox",
+              statusUpdatedAt: now,
+            },
           },
           upsert: true,
         },
@@ -445,11 +497,13 @@ async function normalizeWebhook(body, rawEventId) {
 /* Panel HTML                                                                 */
 /* -------------------------------------------------------------------------- */
 
-function layout({ title, active, stats, content }) {
-  const commentsActive = active === "comments" ? "active" : "";
-  const messagesActive = active === "messages" ? "active" : "";
-  const statusActive = active === "status" ? "active" : "";
+function navLink({ href, label, count, active }) {
+  return `<a class="${active ? "active" : ""}" href="${href}">
+    ${escapeHtml(label)} <span class="nav-badge">${count}</span>
+  </a>`;
+}
 
+function layout({ title, active, stats, content }) {
   return `<!doctype html>
 <html lang="tr">
 <head>
@@ -458,52 +512,59 @@ function layout({ title, active, stats, content }) {
   <meta name="robots" content="noindex,nofollow,noarchive">
   <title>${escapeHtml(title)} · b1rmod Panel</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b0d12; --panel:#121620; --panel2:#171c28; --line:#293142; --text:#f4f6fb; --muted:#9da8ba; --accent:#8da2ff; --good:#52d89f; --warn:#ffc76b; --danger:#ff7b86; --archive:#b59cff; }
+    :root { color-scheme:dark; --bg:#0b0d12; --panel:#121620; --panel2:#171c28; --line:#293142; --text:#f4f6fb; --muted:#9da8ba; --accent:#8da2ff; --good:#52d89f; --warn:#ffc76b; --danger:#ff7b86; --archive:#b59cff; }
     * { box-sizing:border-box; }
     body { margin:0; background:var(--bg); color:var(--text); font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
     a { color:inherit; text-decoration:none; }
-    .shell { width:min(1120px, calc(100% - 28px)); margin:0 auto; }
-    header { position:sticky; top:0; z-index:10; border-bottom:1px solid var(--line); background:rgba(11,13,18,.93); backdrop-filter:blur(12px); }
-    .top { min-height:68px; display:flex; align-items:center; justify-content:space-between; gap:18px; }
-    .brand { font-weight:850; letter-spacing:-.03em; font-size:20px; }
-    nav { display:flex; gap:8px; flex-wrap:wrap; }
-    nav a { padding:9px 12px; border-radius:10px; color:var(--muted); }
+    .shell { width:min(1160px, calc(100% - 28px)); margin:0 auto; }
+    header { position:sticky; top:0; z-index:10; border-bottom:1px solid var(--line); background:rgba(11,13,18,.94); backdrop-filter:blur(12px); }
+    .top { min-height:72px; display:flex; align-items:center; justify-content:space-between; gap:18px; }
+    .brand { font-weight:900; letter-spacing:-.035em; font-size:20px; }
+    nav { display:flex; gap:7px; flex-wrap:wrap; justify-content:flex-end; }
+    nav a { display:flex; align-items:center; gap:7px; padding:9px 11px; border-radius:10px; color:var(--muted); }
     nav a.active, nav a:hover { color:var(--text); background:var(--panel2); }
+    .nav-badge { min-width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center; padding:0 6px; border-radius:999px; background:#0d1119; border:1px solid var(--line); color:var(--text); font-size:11px; }
     main { padding:28px 0 48px; }
     .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:18px; }
     .stat { padding:17px; background:var(--panel); border:1px solid var(--line); border-radius:16px; }
     .stat strong { display:block; font-size:27px; letter-spacing:-.04em; }
     .stat span { color:var(--muted); font-size:13px; }
-    .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:14px; margin-bottom:14px; background:var(--panel); border:1px solid var(--line); border-radius:16px; }
+    .page-title { display:flex; align-items:end; justify-content:space-between; gap:14px; margin:0 0 14px; }
+    .page-title h1 { margin:0; font-size:24px; letter-spacing:-.035em; }
+    .page-title p { margin:5px 0 0; color:var(--muted); font-size:13px; }
+    .toolbar, .bulkbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:14px; margin-bottom:14px; background:var(--panel); border:1px solid var(--line); border-radius:16px; }
+    .bulkbar { position:sticky; top:84px; z-index:8; background:rgba(18,22,32,.96); }
     input, select, button { font:inherit; }
     input, select { min-height:42px; border:1px solid var(--line); border-radius:10px; background:#0e121a; color:var(--text); padding:0 12px; }
     input[type=search] { flex:1 1 280px; }
-    button, .button { min-height:42px; display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:10px; padding:0 15px; background:var(--accent); color:#080b12; font-weight:800; cursor:pointer; }
+    input[type=checkbox] { width:18px; height:18px; min-height:0; accent-color:var(--accent); }
+    button, .button { min-height:42px; display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:10px; padding:0 15px; background:var(--accent); color:#080b12; font-weight:850; cursor:pointer; }
+    button:hover, .button:hover { filter:brightness(1.06); }
     .button-secondary { background:var(--panel2); color:var(--text); border:1px solid var(--line); }
     .button-archive { background:#332b4f; color:#e4ddff; border:1px solid #544776; }
     .button-danger { background:#3b2026; color:#ffd8dc; border:1px solid #6b3039; }
-    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
-    .actions form { margin:0; }
-    .actions button { min-height:36px; padding:0 12px; font-size:13px; }
+    .select-all { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:13px; margin-right:auto; }
     .list { display:grid; gap:10px; }
     .card { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:17px; overflow-wrap:anywhere; transition:.16s ease; }
-    .card.unread { border-color:#5266b4; box-shadow:inset 4px 0 0 var(--accent); }
-    .card.reviewed { opacity:.82; }
-    .card.archived { border-color:#4b426e; background:#11131c; opacity:.76; }
+    .card.inbox { border-color:#45569a; box-shadow:inset 4px 0 0 var(--accent); }
+    .card.archived { border-color:#4b426e; background:#11131c; }
     .card:hover { transform:translateY(-1px); }
+    .card-select { position:absolute; top:17px; left:17px; }
+    .card-body { padding-left:31px; }
     .card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:14px; margin-bottom:10px; }
-    .identity { font-weight:800; }
+    .identity { font-weight:850; }
     .time { color:var(--muted); font-size:13px; text-align:right; white-space:nowrap; }
     .text { white-space:pre-wrap; line-height:1.55; font-size:15px; }
     .meta { display:flex; gap:7px; flex-wrap:wrap; margin-top:13px; }
     .pill { padding:5px 8px; border-radius:999px; background:var(--panel2); color:var(--muted); font-size:12px; border:1px solid var(--line); }
     .pill.good { color:var(--good); }
     .pill.warn { color:var(--warn); }
-    .pill.unread { color:var(--accent); }
-    .pill.reviewed { color:var(--good); }
-    .pill.archived { color:var(--archive); }
+    .pill.archive { color:var(--archive); }
     .parent-preview { margin-top:13px; padding:12px; border-radius:12px; background:#0e121a; border:1px solid var(--line); color:var(--muted); }
     .parent-preview strong { color:var(--text); display:block; margin-bottom:5px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+    .actions form { margin:0; }
+    .actions button { min-height:36px; padding:0 12px; font-size:13px; }
     .notice { margin-bottom:14px; padding:12px 14px; border:1px solid #425487; border-radius:12px; background:#121a31; color:#dce4ff; }
     details { margin-top:12px; color:var(--muted); font-size:12px; }
     summary { cursor:pointer; }
@@ -514,15 +575,8 @@ function layout({ title, active, stats, content }) {
     .page-info { color:var(--muted); font-size:13px; }
     .status-grid { display:grid; gap:12px; grid-template-columns:repeat(2,1fr); }
     .code { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; background:#0d1119; border:1px solid var(--line); border-radius:10px; padding:12px; overflow:auto; }
-    @media (max-width:900px) { .stats { grid-template-columns:repeat(2,1fr); } }
-    @media (max-width:720px) {
-      .top { align-items:flex-start; flex-direction:column; padding:14px 0; }
-      .stats, .status-grid { grid-template-columns:1fr; }
-      .card-head { flex-direction:column; }
-      .time { text-align:left; white-space:normal; }
-      .actions { display:grid; grid-template-columns:1fr 1fr; }
-      .actions button { width:100%; }
-    }
+    @media (max-width:980px) { .stats { grid-template-columns:repeat(2,1fr); } .top { align-items:flex-start; flex-direction:column; padding:14px 0; } nav { justify-content:flex-start; } }
+    @media (max-width:720px) { .stats,.status-grid { grid-template-columns:1fr; } .card-head,.page-title { flex-direction:column; align-items:flex-start; } .time { text-align:left; white-space:normal; } .actions { display:grid; grid-template-columns:1fr 1fr; } .actions button { width:100%; } .bulkbar { top:132px; } }
   </style>
 </head>
 <body>
@@ -530,36 +584,68 @@ function layout({ title, active, stats, content }) {
   <div class="shell top">
     <a class="brand" href="/panel/comments">b1rmod Panel</a>
     <nav>
-      <a class="${commentsActive}" href="/panel/comments">Yorumlar</a>
-      <a class="${messagesActive}" href="/panel/messages">DM’ler</a>
-      <a class="${statusActive}" href="/panel/status">Sistem</a>
+      ${navLink({ href: "/panel/comments", label: "Yorumlar", count: stats.commentInbox, active: active === "comments" })}
+      ${navLink({ href: "/panel/comments/archive", label: "Arşivlenen yorumlar", count: stats.commentArchive, active: active === "commentArchive" })}
+      ${navLink({ href: "/panel/messages", label: "DM’ler", count: stats.messageInbox, active: active === "messages" })}
+      ${navLink({ href: "/panel/messages/archive", label: "Arşivlenen DM’ler", count: stats.messageArchive, active: active === "messageArchive" })}
+      <a class="${active === "status" ? "active" : ""}" href="/panel/status">Sistem</a>
     </nav>
   </div>
 </header>
 <main class="shell">
   <section class="stats">
-    <div class="stat"><strong>${stats.comments}</strong><span>Toplam yorum</span></div>
-    <div class="stat"><strong>${stats.unreadComments}</strong><span>Okunmamış yorum</span></div>
-    <div class="stat"><strong>${stats.archivedComments}</strong><span>Arşivlenmiş yorum</span></div>
-    <div class="stat"><strong>${stats.messages}</strong><span>Toplam DM</span></div>
+    <div class="stat"><strong>${stats.commentInbox}</strong><span>Gelen kutusundaki yorum</span></div>
+    <div class="stat"><strong>${stats.commentArchive}</strong><span>Arşivlenen yorum</span></div>
+    <div class="stat"><strong>${stats.messageInbox}</strong><span>Gelen kutusundaki DM</span></div>
+    <div class="stat"><strong>${stats.messageArchive}</strong><span>Arşivlenen DM</span></div>
   </section>
   ${content}
 </main>
+<script>
+  function toggleAll(source, className) {
+    document.querySelectorAll('.' + className).forEach(function (box) {
+      box.checked = source.checked;
+    });
+  }
+
+  function confirmBulk(form) {
+    const selected = document.querySelectorAll('input[name="ids"]:checked').length;
+    if (!selected) {
+      alert('Önce en az bir kayıt seç.');
+      return false;
+    }
+
+    const action = form.querySelector('select[name="action"]').value;
+    if (action === 'delete') {
+      return confirm(selected + ' kayıt veritabanından kalıcı olarak silinecek. Bu işlem geri alınamaz.');
+    }
+
+    return true;
+  }
+</script>
 </body>
 </html>`;
 }
 
 async function getStats() {
-  const [comments, unreadComments, archivedComments, messages, rawEvents] =
+  const [commentInbox, commentArchive, messageInbox, messageArchive, rawEvents] =
     await Promise.all([
-      Comment.countDocuments({}),
-      Comment.countDocuments({ status: "unread" }),
+      Comment.countDocuments({ status: "inbox" }),
       Comment.countDocuments({ status: "archived" }),
-      Message.countDocuments({}),
+      Message.countDocuments({ status: "inbox" }),
+      Message.countDocuments({ status: "archived" }),
       WebhookEvent.countDocuments({}),
     ]);
 
-  return { comments, unreadComments, archivedComments, messages, rawEvents };
+  return {
+    commentInbox,
+    commentArchive,
+    messageInbox,
+    messageArchive,
+    comments: commentInbox + commentArchive,
+    messages: messageInbox + messageArchive,
+    rawEvents,
+  };
 }
 
 function paginationHtml({ page, pages, basePath, params }) {
@@ -575,6 +661,143 @@ function paginationHtml({ page, pages, basePath, params }) {
     <div class="page-info">Sayfa ${page} / ${pages}</div>
     <a class="button ${page >= pages ? "disabled" : ""}" href="${escapeHtml(next)}">Sonraki →</a>
   </div>`;
+}
+
+function noticeHtml(code) {
+  const messages = {
+    archived: "Kayıt arşive taşındı.",
+    restored: "Kayıt gelen kutusuna geri taşındı.",
+    deleted: "Kayıt ve bağlı ham webhook verisi kalıcı olarak silindi.",
+    "bulk-archived": "Seçilen kayıtlar arşive taşındı.",
+    "bulk-restored": "Seçilen kayıtlar gelen kutusuna geri taşındı.",
+    "bulk-deleted": "Seçilen kayıtlar kalıcı olarak silindi.",
+    "nothing-selected": "Herhangi bir kayıt seçilmedi.",
+  };
+
+  return messages[code]
+    ? `<div class="notice">${escapeHtml(messages[code])}</div>`
+    : "";
+}
+
+function bulkBar({ formId, endpoint, returnTo, archived, checkboxClass }) {
+  return `<form id="${formId}" class="bulkbar" method="post" action="${endpoint}" onsubmit="return confirmBulk(this);">
+    <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+    <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+    <label class="select-all">
+      <input type="checkbox" onchange="toggleAll(this, '${checkboxClass}')"> Bu sayfadakilerin tümünü seç
+    </label>
+    <select name="action">
+      ${archived ? '<option value="restore">Gelen kutusuna taşı</option>' : '<option value="archive">Arşivle</option>'}
+      <option value="delete">Kalıcı sil</option>
+    </select>
+    <button type="submit">Seçililere uygula</button>
+  </form>`;
+}
+
+function commentCard({ item, archived, parent, returnTo, formId, checkboxClass }) {
+  const parentPreview = item.isReply
+    ? `<div class="parent-preview"><strong>Şu yoruma yanıt:</strong>${
+        parent
+          ? `<div>@${escapeHtml(parent.username || "kullanıcı-adı-yok")}: ${escapeHtml(parent.text || "(Boş yorum)")}</div>`
+          : "<div>Ana yorum henüz veritabanında bulunmuyor.</div>"
+      }</div>`
+    : "";
+
+  const stateAction = archived
+    ? `<form method="post" action="/panel/comments/${encodeURIComponent(item.commentId)}/restore">
+        <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+        <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+        <button class="button-secondary" type="submit">↩ Gelen kutusuna taşı</button>
+      </form>`
+    : `<form method="post" action="/panel/comments/${encodeURIComponent(item.commentId)}/archive">
+        <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+        <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+        <button class="button-archive" type="submit">Arşivle</button>
+      </form>`;
+
+  return `<article class="card ${archived ? "archived" : "inbox"}">
+    <input class="card-select ${checkboxClass}" type="checkbox" name="ids" value="${escapeHtml(item.commentId)}" form="${formId}">
+    <div class="card-body">
+      <div class="card-head">
+        <div class="identity">@${escapeHtml(item.username || "kullanıcı-adı-yok")}</div>
+        <div class="time">${escapeHtml(formatDate(item.eventTime || item.firstReceivedAt))}</div>
+      </div>
+      <div class="text">${escapeHtml(item.text || "(Boş yorum)")}</div>
+      ${parentPreview}
+      <div class="meta">
+        ${archived ? '<span class="pill archive">Arşiv</span>' : '<span class="pill good">Gelen kutusu</span>'}
+        <span class="pill ${item.isReply ? "warn" : "good"}">${item.isReply ? "Yanıt" : "Ana yorum"}</span>
+        <span class="pill">${escapeHtml(item.mediaProductType || "Medya türü yok")}</span>
+        <span class="pill">Medya: ${escapeHtml(item.mediaId || "—")}</span>
+      </div>
+      <div class="actions">
+        ${stateAction}
+        <form method="post" action="/panel/comments/${encodeURIComponent(item.commentId)}/delete" onsubmit="return confirm('Bu yorum veritabanından kalıcı olarak silinecek. Geri alınamaz. Emin misin?');">
+          <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+          <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+          <button class="button-danger" type="submit">Kalıcı sil</button>
+        </form>
+      </div>
+      <details>
+        <summary>Teknik bilgiler</summary>
+        <div>Yorum ID: ${escapeHtml(item.commentId)}</div>
+        <div>Yazar ID: ${escapeHtml(item.authorId || "—")}</div>
+        <div>Ana yorum ID: ${escapeHtml(item.parentCommentId || "—")}</div>
+        <div>Durum: ${escapeHtml(item.status || "inbox")}</div>
+      </details>
+    </div>
+  </article>`;
+}
+
+function messageCard({ item, archived, returnTo, formId, checkboxClass }) {
+  const attachmentCount = Array.isArray(item.attachments) ? item.attachments.length : 0;
+  const deleted = item.isDeleted ? "(Silinmiş mesaj)" : null;
+  const body = item.text || deleted || (attachmentCount ? `[${attachmentCount} ek]` : "(Metinsiz mesaj)");
+
+  const stateAction = archived
+    ? `<form method="post" action="/panel/messages/${encodeURIComponent(item.mid)}/restore">
+        <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+        <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+        <button class="button-secondary" type="submit">↩ Gelen kutusuna taşı</button>
+      </form>`
+    : `<form method="post" action="/panel/messages/${encodeURIComponent(item.mid)}/archive">
+        <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+        <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+        <button class="button-archive" type="submit">Arşivle</button>
+      </form>`;
+
+  return `<article class="card ${archived ? "archived" : "inbox"}">
+    <input class="card-select ${checkboxClass}" type="checkbox" name="ids" value="${escapeHtml(item.mid)}" form="${formId}">
+    <div class="card-body">
+      <div class="card-head">
+        <div class="identity">${item.direction === "incoming" ? "Gelen DM" : "Gönderilen DM"}</div>
+        <div class="time">${escapeHtml(formatDate(item.eventTime || item.firstReceivedAt))}</div>
+      </div>
+      <div class="text">${escapeHtml(body)}</div>
+      <div class="meta">
+        ${archived ? '<span class="pill archive">Arşiv</span>' : '<span class="pill good">Gelen kutusu</span>'}
+        <span class="pill ${item.direction === "incoming" ? "good" : "warn"}">${item.direction === "incoming" ? "Gelen" : "Giden"}</span>
+        ${attachmentCount ? `<span class="pill">${attachmentCount} ek</span>` : ""}
+        ${item.isDeleted ? '<span class="pill warn">Silinmiş</span>' : ""}
+        ${item.replyTo ? '<span class="pill">Yanıt</span>' : ""}
+      </div>
+      <div class="actions">
+        ${stateAction}
+        <form method="post" action="/panel/messages/${encodeURIComponent(item.mid)}/delete" onsubmit="return confirm('Bu DM veritabanından kalıcı olarak silinecek. Geri alınamaz. Emin misin?');">
+          <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
+          <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+          <button class="button-danger" type="submit">Kalıcı sil</button>
+        </form>
+      </div>
+      <details>
+        <summary>Teknik bilgiler</summary>
+        <div>Mesaj ID: ${escapeHtml(item.mid)}</div>
+        <div>Gönderen ID: ${escapeHtml(item.senderId || "—")}</div>
+        <div>Alıcı ID: ${escapeHtml(item.recipientId || "—")}</div>
+        <div>Durum: ${escapeHtml(item.status || "inbox")}</div>
+      </details>
+    </div>
+  </article>`;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -594,10 +817,9 @@ app.get("/", (req, res) => {
 });
 
 app.use("/panel", panelAuth);
-
 app.get("/panel", (req, res) => res.redirect(302, "/panel/comments"));
 
-app.get("/panel/comments", async (req, res, next) => {
+async function renderCommentsPage(req, res, next, archived) {
   try {
     const page = clampInteger(req.query.page, 1, 100000, 1);
     const limit = clampInteger(req.query.limit, 10, 100, 50);
@@ -605,256 +827,155 @@ app.get("/panel/comments", async (req, res, next) => {
     const type = ["all", "main", "reply"].includes(req.query.type)
       ? req.query.type
       : "all";
-    const status = ["all", "unread", "reviewed", "archived"].includes(
-      req.query.status
-    )
-      ? req.query.status
-      : "all";
+    const basePath = archived ? "/panel/comments/archive" : "/panel/comments";
+    const filter = { status: archived ? "archived" : "inbox" };
 
-    const filter = {};
     if (type === "main") filter.isReply = false;
     if (type === "reply") filter.isReply = true;
-    if (status !== "all") filter.status = status;
 
     if (q) {
       const regex = new RegExp(escapeRegex(q), "i");
-      filter.$or = [{ text: regex }, { username: regex }, { commentId: regex }];
+      filter.$or = [
+        { text: regex },
+        { username: regex },
+        { commentId: regex },
+        { authorId: regex },
+        { mediaId: regex },
+      ];
     }
 
-    const [items, total, stats] = await Promise.all([
-      Comment.find(filter)
-        .sort({ eventTime: -1, firstReceivedAt: -1, _id: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean(),
+    const [total, stats] = await Promise.all([
       Comment.countDocuments(filter),
       getStats(),
     ]);
 
-    const parentIds = items
-      .map((item) => item.parentCommentId)
-      .filter(Boolean);
-
-    const parentItems = parentIds.length
-      ? await Comment.find({ commentId: { $in: parentIds } })
-          .select({ commentId: 1, username: 1, text: 1 })
-          .lean()
-      : [];
-
-    const parentMap = new Map(parentItems.map((item) => [item.commentId, item]));
     const pages = Math.max(1, Math.ceil(total / limit));
     const safePage = Math.min(page, pages);
-    const returnTo = `/panel/comments${encodeQuery({ q, type, status, limit, page: safePage })}`;
+    const items = await Comment.find(filter)
+      .sort({ eventTime: -1, firstReceivedAt: -1, _id: -1 })
+      .skip((safePage - 1) * limit)
+      .limit(limit)
+      .lean();
+
+    const parentIds = Array.from(
+      new Set(items.map((item) => item.parentCommentId).filter(Boolean))
+    );
+    const parents = parentIds.length
+      ? await Comment.find({ commentId: { $in: parentIds } }).lean()
+      : [];
+    const parentMap = new Map(parents.map((item) => [item.commentId, item]));
+    const returnTo = `${basePath}${encodeQuery({ q, type, limit, page: safePage })}`;
+    const formId = archived ? "bulk-comment-archive" : "bulk-comment-inbox";
+    const checkboxClass = archived ? "comment-archive-box" : "comment-inbox-box";
 
     const cards = items.length
-      ? items
-          .map((item) => {
-            const currentStatus = item.status || "unread";
-            const parent = item.parentCommentId
-              ? parentMap.get(item.parentCommentId)
-              : null;
-
-            const parentPreview = item.isReply
-              ? `<div class="parent-preview">
-                  <strong>Şu yoruma yanıt:</strong>
-                  ${
-                    parent
-                      ? `<div>@${escapeHtml(parent.username || "kullanıcı-adı-yok")}: ${escapeHtml(
-                          parent.text || "(Boş yorum)"
-                        )}</div>`
-                      : `<div>Ana yorum henüz veritabanında bulunmuyor.</div>`
-                  }
-                </div>`
-              : "";
-
-            let primaryAction = "";
-            if (currentStatus === "unread") {
-              primaryAction = `<form method="post" action="/panel/comments/${encodeURIComponent(
-                item.commentId
-              )}/status">
-                <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
-                <input type="hidden" name="status" value="reviewed">
-                <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
-                <button type="submit">✓ İncelendi</button>
-              </form>`;
-            } else if (currentStatus === "reviewed") {
-              primaryAction = `<form method="post" action="/panel/comments/${encodeURIComponent(
-                item.commentId
-              )}/status">
-                <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
-                <input type="hidden" name="status" value="unread">
-                <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
-                <button class="button-secondary" type="submit">● Okunmamış yap</button>
-              </form>`;
-            } else {
-              primaryAction = `<form method="post" action="/panel/comments/${encodeURIComponent(
-                item.commentId
-              )}/status">
-                <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
-                <input type="hidden" name="status" value="reviewed">
-                <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
-                <button class="button-secondary" type="submit">↩ Arşivden çıkar</button>
-              </form>`;
-            }
-
-            const archiveAction = currentStatus === "archived"
-              ? ""
-              : `<form method="post" action="/panel/comments/${encodeURIComponent(
-                  item.commentId
-                )}/status">
-                  <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
-                  <input type="hidden" name="status" value="archived">
-                  <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
-                  <button class="button-archive" type="submit">Arşivle</button>
-                </form>`;
-
-            return `<article class="card ${statusClass(currentStatus)}">
-              <div class="card-head">
-                <div class="identity">@${escapeHtml(
-                  item.username || "kullanıcı-adı-yok"
-                )}</div>
-                <div class="time">${escapeHtml(
-                  formatDate(item.eventTime || item.firstReceivedAt)
-                )}</div>
-              </div>
-              <div class="text">${escapeHtml(item.text || "(Boş yorum)")}</div>
-              ${parentPreview}
-              <div class="meta">
-                <span class="pill ${statusClass(currentStatus)}">${statusLabel(
-                  currentStatus
-                )}</span>
-                <span class="pill ${item.isReply ? "warn" : "good"}">${
-                  item.isReply ? "Yanıt" : "Ana yorum"
-                }</span>
-                <span class="pill">${escapeHtml(
-                  item.mediaProductType || "Medya türü yok"
-                )}</span>
-                <span class="pill">Medya: ${escapeHtml(item.mediaId || "—")}</span>
-              </div>
-              <div class="actions">
-                ${primaryAction}
-                ${archiveAction}
-                <form method="post" action="/panel/comments/${encodeURIComponent(
-                  item.commentId
-                )}/delete" onsubmit="return confirm('Bu yorum veritabanından kalıcı olarak silinecek. Geri alınamaz. Emin misin?');">
-                  <input type="hidden" name="csrf" value="${PANEL_CSRF_TOKEN}">
-                  <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
-                  <button class="button-danger" type="submit">Kalıcı sil</button>
-                </form>
-              </div>
-              <details>
-                <summary>Teknik bilgiler</summary>
-                <div>Yorum ID: ${escapeHtml(item.commentId)}</div>
-                <div>Yazar ID: ${escapeHtml(item.authorId || "—")}</div>
-                <div>Ana yorum ID: ${escapeHtml(item.parentCommentId || "—")}</div>
-                <div>Durum: ${escapeHtml(currentStatus)}</div>
-              </details>
-            </article>`;
-          })
-          .join("")
-      : '<div class="empty">Bu filtreyle eşleşen yorum bulunamadı.</div>';
-
-    const notice = String(req.query.notice || "");
-    const noticeHtml = notice
-      ? `<div class="notice">${escapeHtml(
-          notice === "deleted"
-            ? "Yorum ve bağlı ham webhook verisi kalıcı olarak silindi."
-            : "Yorum durumu güncellendi."
-        )}</div>`
-      : "";
+      ? items.map((item) => commentCard({
+          item,
+          archived,
+          parent: item.parentCommentId ? parentMap.get(item.parentCommentId) : null,
+          returnTo,
+          formId,
+          checkboxClass,
+        })).join("")
+      : `<div class="empty">${archived ? "Arşivlenmiş yorum bulunamadı." : "Gelen kutusunda yorum kalmadı."}</div>`;
 
     const content = `
-      ${noticeHtml}
-      <form class="toolbar" method="get" action="/panel/comments">
-        <input type="search" name="q" value="${escapeHtml(
-          q
-        )}" placeholder="Yorum, kullanıcı adı veya ID ara">
-        <select name="status">
-          <option value="all" ${status === "all" ? "selected" : ""}>Tüm durumlar</option>
-          <option value="unread" ${status === "unread" ? "selected" : ""}>Okunmamış</option>
-          <option value="reviewed" ${status === "reviewed" ? "selected" : ""}>İncelendi</option>
-          <option value="archived" ${status === "archived" ? "selected" : ""}>Arşiv</option>
-        </select>
+      ${noticeHtml(String(req.query.notice || ""))}
+      <div class="page-title">
+        <div><h1>${archived ? "Arşivlenen yorumlar" : "Yorumlar"}</h1><p>${archived ? "Saklamak istediğin yorumlar burada durur." : "Yeni yorumlar burada bekler; arşivle veya kalıcı sil."}</p></div>
+      </div>
+      <form class="toolbar" method="get" action="${basePath}">
+        <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Yorum, kullanıcı adı veya ID ara">
         <select name="type">
           <option value="all" ${type === "all" ? "selected" : ""}>Tüm yorum türleri</option>
           <option value="main" ${type === "main" ? "selected" : ""}>Ana yorumlar</option>
           <option value="reply" ${type === "reply" ? "selected" : ""}>Yanıtlar</option>
         </select>
         <select name="limit">
-          ${[25, 50, 100]
-            .map(
-              (value) =>
-                `<option value="${value}" ${
-                  limit === value ? "selected" : ""
-                }>${value} / sayfa</option>`
-            )
-            .join("")}
+          ${[25, 50, 100].map((value) => `<option value="${value}" ${limit === value ? "selected" : ""}>${value} / sayfa</option>`).join("")}
         </select>
         <button type="submit">Filtrele</button>
       </form>
+      ${items.length ? bulkBar({ formId, endpoint: "/panel/comments/bulk", returnTo, archived, checkboxClass }) : ""}
       <div class="list">${cards}</div>
-      ${paginationHtml({
-        page: safePage,
-        pages,
-        basePath: "/panel/comments",
-        params: { q, type, status, limit },
-      })}`;
+      ${paginationHtml({ page: safePage, pages, basePath, params: { q, type, limit } })}`;
 
-    return res.status(200).send(
-      layout({ title: "Yorumlar", active: "comments", stats, content })
-    );
+    return res.status(200).send(layout({
+      title: archived ? "Arşivlenen yorumlar" : "Yorumlar",
+      active: archived ? "commentArchive" : "comments",
+      stats,
+      content,
+    }));
   } catch (error) {
     return next(error);
   }
-});
+}
 
-app.post("/panel/comments/:commentId/status", async (req, res, next) => {
+app.get("/panel/comments", (req, res, next) => renderCommentsPage(req, res, next, false));
+app.get("/panel/comments/archive", (req, res, next) => renderCommentsPage(req, res, next, true));
+
+app.post("/panel/comments/:commentId/archive", async (req, res, next) => {
   try {
     if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
-
-    const commentId = String(req.params.commentId || "");
-    const status = ["unread", "reviewed", "archived"].includes(req.body.status)
-      ? req.body.status
-      : null;
-
-    if (!/^\d+$/.test(commentId) || !status) {
-      return res.status(400).send("Geçersiz yorum işlemi.");
-    }
-
     await Comment.updateOne(
-      { commentId },
-      { $set: { status, statusUpdatedAt: new Date() } }
+      { commentId: String(req.params.commentId || "") },
+      { $set: { status: "archived", statusUpdatedAt: new Date() } }
     );
+    return redirectWithNotice(res, req.body.returnTo, "archived");
+  } catch (error) { return next(error); }
+});
 
-    const returnTo = safeReturnTo(req.body.returnTo);
-    const separator = returnTo.includes("?") ? "&" : "?";
-    return res.redirect(303, `${returnTo}${separator}notice=updated`);
-  } catch (error) {
-    return next(error);
-  }
+app.post("/panel/comments/:commentId/restore", async (req, res, next) => {
+  try {
+    if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
+    await Comment.updateOne(
+      { commentId: String(req.params.commentId || "") },
+      { $set: { status: "inbox", statusUpdatedAt: new Date() } }
+    );
+    return redirectWithNotice(res, req.body.returnTo, "restored");
+  } catch (error) { return next(error); }
 });
 
 app.post("/panel/comments/:commentId/delete", async (req, res, next) => {
   try {
     if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
-
     const commentId = String(req.params.commentId || "");
-    if (!/^\d+$/.test(commentId)) {
-      return res.status(400).send("Geçersiz yorum kimliği.");
-    }
-
     const item = await Comment.findOneAndDelete({ commentId });
     if (item) await removeCommentFromRawEvent(item.rawEventId, commentId);
-
-    const returnTo = safeReturnTo(req.body.returnTo);
-    const separator = returnTo.includes("?") ? "&" : "?";
-    return res.redirect(303, `${returnTo}${separator}notice=deleted`);
-  } catch (error) {
-    return next(error);
-  }
+    return redirectWithNotice(res, req.body.returnTo, "deleted");
+  } catch (error) { return next(error); }
 });
 
-app.get("/panel/messages", async (req, res, next) => {
+app.post("/panel/comments/bulk", async (req, res, next) => {
+  try {
+    if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
+    const ids = selectedValues(req.body.ids);
+    const action = String(req.body.action || "");
+    if (!ids.length) return redirectWithNotice(res, req.body.returnTo, "nothing-selected");
+
+    if (action === "archive" || action === "restore") {
+      const status = action === "archive" ? "archived" : "inbox";
+      await Comment.updateMany(
+        { commentId: { $in: ids } },
+        { $set: { status, statusUpdatedAt: new Date() } }
+      );
+      return redirectWithNotice(res, req.body.returnTo, action === "archive" ? "bulk-archived" : "bulk-restored");
+    }
+
+    if (action === "delete") {
+      const items = await Comment.find({ commentId: { $in: ids } }).lean();
+      await Comment.deleteMany({ commentId: { $in: ids } });
+      for (const item of items) {
+        await removeCommentFromRawEvent(item.rawEventId, item.commentId);
+      }
+      return redirectWithNotice(res, req.body.returnTo, "bulk-deleted");
+    }
+
+    return res.status(400).send("Geçersiz toplu işlem.");
+  } catch (error) { return next(error); }
+});
+
+async function renderMessagesPage(req, res, next, archived) {
   try {
     const page = clampInteger(req.query.page, 1, 100000, 1);
     const limit = clampInteger(req.query.limit, 10, 100, 50);
@@ -862,10 +983,10 @@ app.get("/panel/messages", async (req, res, next) => {
     const direction = ["all", "incoming", "outgoing"].includes(req.query.direction)
       ? req.query.direction
       : "all";
+    const basePath = archived ? "/panel/messages/archive" : "/panel/messages";
+    const filter = { status: archived ? "archived" : "inbox" };
 
-    const filter = {};
     if (direction !== "all") filter.direction = direction;
-
     if (q) {
       const regex = new RegExp(escapeRegex(q), "i");
       filter.$or = [
@@ -876,53 +997,31 @@ app.get("/panel/messages", async (req, res, next) => {
       ];
     }
 
-    const [items, total, stats] = await Promise.all([
-      Message.find(filter)
-        .sort({ eventTime: -1, firstReceivedAt: -1, _id: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean(),
+    const [total, stats] = await Promise.all([
       Message.countDocuments(filter),
       getStats(),
     ]);
-
     const pages = Math.max(1, Math.ceil(total / limit));
     const safePage = Math.min(page, pages);
+    const items = await Message.find(filter)
+      .sort({ eventTime: -1, firstReceivedAt: -1, _id: -1 })
+      .skip((safePage - 1) * limit)
+      .limit(limit)
+      .lean();
 
+    const returnTo = `${basePath}${encodeQuery({ q, direction, limit, page: safePage })}`;
+    const formId = archived ? "bulk-message-archive" : "bulk-message-inbox";
+    const checkboxClass = archived ? "message-archive-box" : "message-inbox-box";
     const cards = items.length
-      ? items
-          .map((item) => {
-            const attachmentCount = Array.isArray(item.attachments)
-              ? item.attachments.length
-              : 0;
-            const deleted = item.isDeleted ? "(Silinmiş mesaj)" : null;
-            const body = item.text || deleted || (attachmentCount ? `[${attachmentCount} ek]` : "(Metinsiz mesaj)");
-
-            return `<article class="card">
-              <div class="card-head">
-                <div class="identity">${item.direction === "incoming" ? "Gelen DM" : "Gönderilen DM"}</div>
-                <div class="time">${escapeHtml(formatDate(item.eventTime || item.firstReceivedAt))}</div>
-              </div>
-              <div class="text">${escapeHtml(body)}</div>
-              <div class="meta">
-                <span class="pill ${item.direction === "incoming" ? "good" : "warn"}">${item.direction === "incoming" ? "Gelen" : "Giden"}</span>
-                ${attachmentCount ? `<span class="pill">${attachmentCount} ek</span>` : ""}
-                ${item.isDeleted ? '<span class="pill warn">Silinmiş</span>' : ""}
-                ${item.replyTo ? '<span class="pill">Yanıt</span>' : ""}
-              </div>
-              <details>
-                <summary>Teknik bilgiler</summary>
-                <div>Mesaj ID: ${escapeHtml(item.mid)}</div>
-                <div>Gönderen ID: ${escapeHtml(item.senderId || "—")}</div>
-                <div>Alıcı ID: ${escapeHtml(item.recipientId || "—")}</div>
-              </details>
-            </article>`;
-          })
-          .join("")
-      : '<div class="empty">Bu filtreyle eşleşen DM bulunamadı.</div>';
+      ? items.map((item) => messageCard({ item, archived, returnTo, formId, checkboxClass })).join("")
+      : `<div class="empty">${archived ? "Arşivlenmiş DM bulunamadı." : "Gelen kutusunda DM kalmadı."}</div>`;
 
     const content = `
-      <form class="toolbar" method="get" action="/panel/messages">
+      ${noticeHtml(String(req.query.notice || ""))}
+      <div class="page-title">
+        <div><h1>${archived ? "Arşivlenen DM’ler" : "DM’ler"}</h1><p>${archived ? "Saklamak istediğin mesajlar burada durur." : "Mesajları arşivle veya veritabanından kalıcı sil."}</p></div>
+      </div>
+      <form class="toolbar" method="get" action="${basePath}">
         <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Mesaj metni veya ID ara">
         <select name="direction">
           <option value="all" ${direction === "all" ? "selected" : ""}>Tümü</option>
@@ -930,26 +1029,87 @@ app.get("/panel/messages", async (req, res, next) => {
           <option value="outgoing" ${direction === "outgoing" ? "selected" : ""}>Gönderilenler</option>
         </select>
         <select name="limit">
-          ${[25, 50, 100]
-            .map((value) => `<option value="${value}" ${limit === value ? "selected" : ""}>${value} / sayfa</option>`)
-            .join("")}
+          ${[25, 50, 100].map((value) => `<option value="${value}" ${limit === value ? "selected" : ""}>${value} / sayfa</option>`).join("")}
         </select>
         <button type="submit">Filtrele</button>
       </form>
+      ${items.length ? bulkBar({ formId, endpoint: "/panel/messages/bulk", returnTo, archived, checkboxClass }) : ""}
       <div class="list">${cards}</div>
-      ${paginationHtml({
-        page: safePage,
-        pages,
-        basePath: "/panel/messages",
-        params: { q, direction, limit },
-      })}`;
+      ${paginationHtml({ page: safePage, pages, basePath, params: { q, direction, limit } })}`;
 
-    return res.status(200).send(
-      layout({ title: "DM’ler", active: "messages", stats, content })
-    );
+    return res.status(200).send(layout({
+      title: archived ? "Arşivlenen DM’ler" : "DM’ler",
+      active: archived ? "messageArchive" : "messages",
+      stats,
+      content,
+    }));
   } catch (error) {
     return next(error);
   }
+}
+
+app.get("/panel/messages", (req, res, next) => renderMessagesPage(req, res, next, false));
+app.get("/panel/messages/archive", (req, res, next) => renderMessagesPage(req, res, next, true));
+
+app.post("/panel/messages/:mid/archive", async (req, res, next) => {
+  try {
+    if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
+    await Message.updateOne(
+      { mid: String(req.params.mid || "") },
+      { $set: { status: "archived", statusUpdatedAt: new Date() } }
+    );
+    return redirectWithNotice(res, req.body.returnTo, "archived");
+  } catch (error) { return next(error); }
+});
+
+app.post("/panel/messages/:mid/restore", async (req, res, next) => {
+  try {
+    if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
+    await Message.updateOne(
+      { mid: String(req.params.mid || "") },
+      { $set: { status: "inbox", statusUpdatedAt: new Date() } }
+    );
+    return redirectWithNotice(res, req.body.returnTo, "restored");
+  } catch (error) { return next(error); }
+});
+
+app.post("/panel/messages/:mid/delete", async (req, res, next) => {
+  try {
+    if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
+    const mid = String(req.params.mid || "");
+    const item = await Message.findOneAndDelete({ mid });
+    if (item) await removeMessageFromRawEvent(item.rawEventId, mid);
+    return redirectWithNotice(res, req.body.returnTo, "deleted");
+  } catch (error) { return next(error); }
+});
+
+app.post("/panel/messages/bulk", async (req, res, next) => {
+  try {
+    if (!verifyPanelCsrf(req)) return res.status(403).send("Geçersiz panel isteği.");
+    const ids = selectedValues(req.body.ids);
+    const action = String(req.body.action || "");
+    if (!ids.length) return redirectWithNotice(res, req.body.returnTo, "nothing-selected");
+
+    if (action === "archive" || action === "restore") {
+      const status = action === "archive" ? "archived" : "inbox";
+      await Message.updateMany(
+        { mid: { $in: ids } },
+        { $set: { status, statusUpdatedAt: new Date() } }
+      );
+      return redirectWithNotice(res, req.body.returnTo, action === "archive" ? "bulk-archived" : "bulk-restored");
+    }
+
+    if (action === "delete") {
+      const items = await Message.find({ mid: { $in: ids } }).lean();
+      await Message.deleteMany({ mid: { $in: ids } });
+      for (const item of items) {
+        await removeMessageFromRawEvent(item.rawEventId, item.mid);
+      }
+      return redirectWithNotice(res, req.body.returnTo, "bulk-deleted");
+    }
+
+    return res.status(400).send("Geçersiz toplu işlem.");
+  } catch (error) { return next(error); }
 });
 
 app.get("/panel/status", async (req, res, next) => {
@@ -962,24 +1122,20 @@ app.get("/panel/status", async (req, res, next) => {
     ]);
 
     const content = `<div class="status-grid">
-      <section class="card">
-        <div class="identity">Bağlantı durumu</div>
-        <div class="meta">
-          <span class="pill good">Node.js çalışıyor</span>
-          <span class="pill ${mongoose.connection.readyState === 1 ? "good" : "warn"}">MongoDB ${mongoose.connection.readyState === 1 ? "bağlı" : "bağlı değil"}</span>
-          <span class="pill good">İmza doğrulaması aktif</span>
-          <span class="pill good">Ham kayıtlar ${RAW_EVENT_RETENTION_DAYS} gün saklanır</span>
-        </div>
-      </section>
-      <section class="card">
-        <div class="identity">Son hareketler</div>
-        <div class="code">Son webhook: ${escapeHtml(formatDate(lastWebhook?.receivedAt))}<br>Son yorum: ${escapeHtml(formatDate(lastComment?.eventTime || lastComment?.firstReceivedAt))}<br>Son DM: ${escapeHtml(formatDate(lastMessage?.eventTime || lastMessage?.firstReceivedAt))}</div>
-      </section>
+      <section class="card"><div class="identity">Bağlantı durumu</div><div class="meta">
+        <span class="pill good">Node.js çalışıyor</span>
+        <span class="pill ${mongoose.connection.readyState === 1 ? "good" : "warn"}">MongoDB ${mongoose.connection.readyState === 1 ? "bağlı" : "bağlı değil"}</span>
+        <span class="pill good">İmza doğrulaması aktif</span>
+        <span class="pill good">Ham kayıtlar ${RAW_EVENT_RETENTION_DAYS} gün saklanır</span>
+      </div></section>
+      <section class="card"><div class="identity">Son hareketler</div><div class="code">
+        Son webhook: ${escapeHtml(formatDate(lastWebhook?.receivedAt))}<br>
+        Son yorum: ${escapeHtml(formatDate(lastComment?.eventTime || lastComment?.firstReceivedAt))}<br>
+        Son DM: ${escapeHtml(formatDate(lastMessage?.eventTime || lastMessage?.firstReceivedAt))}
+      </div></section>
     </div>`;
 
-    return res.status(200).send(
-      layout({ title: "Sistem", active: "status", stats, content })
-    );
+    return res.status(200).send(layout({ title: "Sistem", active: "status", stats, content }));
   } catch (error) {
     return next(error);
   }
@@ -1113,14 +1269,22 @@ app.use((error, req, res, next) => {
 /* -------------------------------------------------------------------------- */
 
 async function runMigrations() {
+  const now = new Date();
+
+  // v1.1'deki "unread" ve "reviewed" kayıtları karar verilmesi için gelen kutusuna döner.
   await Comment.updateMany(
-    { status: { $exists: false } },
-    { $set: { status: "unread", statusUpdatedAt: new Date() } }
+    { status: { $nin: ["inbox", "archived"] } },
+    { $set: { status: "inbox", statusUpdatedAt: now } }
+  );
+
+  await Message.updateMany(
+    { status: { $nin: ["inbox", "archived"] } },
+    { $set: { status: "inbox", statusUpdatedAt: now } }
   );
 
   await WebhookEvent.updateMany(
     { processedAt: { $exists: false } },
-    { $set: { processedAt: new Date() } }
+    { $set: { processedAt: now } }
   );
 
   await WebhookEvent.updateMany(
@@ -1139,7 +1303,7 @@ mongoose
   .then(async () => {
     console.log("MongoDB bağlantısı başarılı.");
     await runMigrations();
-    console.log(`Panel v1.1 hazır. Ham webhook saklama süresi: ${RAW_EVENT_RETENTION_DAYS} gün.`);
+    console.log(`Panel v1.2 hazır. Ham webhook saklama süresi: ${RAW_EVENT_RETENTION_DAYS} gün.`);
     app.listen(PORT, () => {
       console.log(`Sunucu ${PORT} portunda çalışıyor.`);
     });
