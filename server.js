@@ -5,29 +5,26 @@ const mongoose = require('mongoose');
 const app = express();
 app.use(bodyParser.json());
 
-// Veritabanı bağlantısı (Link Coolify'dan gelecek)
 const mongoUrl = process.env.MONGO_URL;
-mongoose.connect(mongoUrl, { useNewUrlParser: true, useUnifiedTopology: true })
+mongoose.connect(mongoUrl)
   .then(() => console.log('MongoDB baglantisi basarili!'))
   .catch(err => console.error('MongoDB hatasi:', err));
 
-// Gelen her şeyi tutacak esnek şema
 const WebhookSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now },
   body: Object
 });
 const WebhookLog = mongoose.model('WebhookLog', WebhookSchema);
 
-// Meta'nın güvenlik doğrulaması
 app.get('/webhook', (req, res) => {
-  const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "benim_gizli_tokenim";
+  const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "b1rmod_token";
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
   if (mode && token) {
     if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-      console.log('Webhook Meta tarafindan dogrulandi.');
+      console.log('Webhook dogrulandi.');
       res.status(200).send(challenge);
     } else {
       res.sendStatus(403);
@@ -35,21 +32,16 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// Instagram verilerini yakalayıp veritabanına yazma
+// Gelen her şeyi direkt yakala ve kaydet
 app.post('/webhook', async (req, res) => {
-  const body = req.body;
-  
-  if (body.object === 'instagram') {
-    try {
-      await WebhookLog.create({ body: body });
-      console.log('Yeni veri basariyla MongoDB ye kaydedildi!');
-    } catch (error) {
-      console.error('Veritabani kayit hatasi:', error);
-    }
-    res.status(200).send('EVENT_RECEIVED');
-  } else {
-    res.sendStatus(404);
+  console.log('Gelen İstek:', JSON.stringify(req.body));
+  try {
+    await WebhookLog.create({ body: req.body });
+    console.log('Yeni veri basariyla MongoDB ye kaydedildi!');
+  } catch (error) {
+    console.error('Kayit hatasi:', error);
   }
+  res.status(200).send('EVENT_RECEIVED');
 });
 
 const PORT = process.env.PORT || 3000;
